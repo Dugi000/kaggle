@@ -24,14 +24,26 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def shap_select(X: pd.DataFrame, y: pd.Series, top: int = 15) -> list:
+    """Select top features using SHAP values computed on a sample."""
     imp = SimpleImputer(strategy='median')
     X_imp = pd.DataFrame(imp.fit_transform(X), columns=X.columns)
-    model = XGBClassifier(n_estimators=200, max_depth=5, learning_rate=0.05,
-                          subsample=0.8, colsample_bytree=0.8, random_state=42,
-                          eval_metric='mlogloss', n_jobs=-1)
+
+    model = XGBClassifier(
+        n_estimators=200,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        eval_metric="mlogloss",
+        n_jobs=-1,
+    )
     model.fit(X_imp, y)
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X_imp)
+
+    # Use a random subset to speed up SHAP computation
+    x_sample = X_imp.sample(n=min(500, len(X_imp)), random_state=42)
+    explainer = shap.TreeExplainer(model, data=x_sample, approximate=True)
+    shap_values = explainer.shap_values(x_sample)
     if isinstance(shap_values, list):
         shap_values = np.stack(shap_values, axis=-1)
     scores = np.abs(shap_values).mean(axis=(0, 2))
