@@ -10,6 +10,8 @@ from sklearn.metrics import f1_score
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from xgboost import XGBClassifier
 import itertools
+import os
+import pickle
 
 
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -60,6 +62,26 @@ def remove_outliers(X: pd.DataFrame, y: pd.Series):
     return X.loc[mask].reset_index(drop=True), y.loc[mask].reset_index(drop=True)
 
 
+def prepare_data(X, y, X_test, feature_selection, scaler_type, outlier):
+    """Return processed data and scaler based on options."""
+    X_use = X.copy()
+    y_use = y.copy()
+
+    if outlier:
+        X_use, y_use = remove_outliers(X_use, y_use)
+
+    if feature_selection:
+        selected = shap_select(X_use, y_use, top=15)
+    else:
+        selected = [c for c in X_use.columns if c != 'Annual_Income']
+
+    X_use = X_use[selected]
+    X_test_use = X_test[selected]
+
+    scaler = StandardScaler() if scaler_type == 'standard' else RobustScaler()
+    return X_use, y_use, X_test_use, scaler
+
+
 def build_model(name: str):
     if name == 'rf':
         return RandomForestClassifier(n_estimators=300, max_depth=15,
@@ -79,21 +101,9 @@ def build_model(name: str):
 
 def evaluate_combo(X, y, X_test, feature_selection, scaler_type, outlier,
                     model_name, postprocess):
-    X_use = X.copy()
-    y_use = y.copy()
-
-    if outlier:
-        X_use, y_use = remove_outliers(X_use, y_use)
-
-    if feature_selection:
-        selected = shap_select(X_use, y_use, top=15)
-    else:
-        selected = [c for c in X_use.columns if c != 'Annual_Income']
-
-    X_use = X_use[selected]
-    X_test_use = X_test[selected]
-
-    scaler = StandardScaler() if scaler_type == 'standard' else RobustScaler()
+    X_use, y_use, X_test_use, scaler = prepare_data(
+        X, y, X_test, feature_selection, scaler_type, outlier
+    )
     model = build_model(model_name)
     skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
 
@@ -149,18 +159,35 @@ def main():
     x_test = add_features(x_test)
 
     options = list(itertools.product(
-        [True, False],
-        ['standard', 'robust'],
-        [True, False],
-        ['rf', 'xgb', 'gb'],
-        [True, False]
+        [True, False],            # feature selection
+        ['standard'],             # scaler
+        [True, False],            # outlier removal
+        ['rf', 'xgb'],            # models
+        [False]                   # postprocess
     ))
 
+    cache_dir = 'automl_cache'
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(cache_dir, 'results.pkl')
+    if os.path.exists(cache_path):
+        with open(cache_path, 'rb') as f:
+            cached_scores = pickle.load(f)
+    else:
+        cached_scores = {}
+
     results = []
-    combos = {}
     for feat_sel, scaler, outlier, model, post in options:
-        score, X_proc, y_proc, X_test_proc, scaler_obj, model_obj = evaluate_combo(
-            x_train, y_train, x_test, feat_sel, scaler, outlier, model, post)
+        key = (feat_sel, scaler, outlier, model, post)
+        if key in cached_scores:
+            score = cached_scores[key]
+            print(f'Skip {key}, cached score {score:.4f}')
+        else:
+            score, _, _, _, _, _ = evaluate_combo(
+                x_train, y_train, x_test, feat_sel, scaler, outlier, model, post)
+            cached_scores[key] = score
+            with open(cache_path, 'wb') as f:
+                pickle.dump(cached_scores, f)
+            print(f'Computed {key} -> {score:.4f}')
         results.append({
             'feature_selection': feat_sel,
             'scaler': scaler,
@@ -169,9 +196,6 @@ def main():
             'postprocess': post,
             'f1_macro': score
         })
-        combos[(feat_sel, scaler, outlier, model, post)] = (
-            X_proc, y_proc, X_test_proc, scaler_obj, model_obj)
-        print(f'Combo {(feat_sel, scaler, outlier, model, post)} -> {score:.4f}')
 
     result_df = pd.DataFrame(results)
     print(result_df.sort_values('f1_macro', ascending=False))
@@ -181,7 +205,13 @@ def main():
                 best.model, best.postprocess)
     print(f'Best Combo: {best_key} with F1 {best.f1_macro:.4f}')
 
-    X_best, y_best, X_test_best, scaler_best, model_best = combos[best_key]
+    X_best, y_best, X_test_best, scaler_best = prepare_data(
+        x_train, y_train, x_test,
+        best.feature_selection,
+        best.scaler,
+        best.outlier_removal,
+    )
+    model_best = build_model(best.model)
     preds = final_train_predict(X_best, y_best, X_test_best,
                                 scaler_best, model_best, best_key[4])
 
